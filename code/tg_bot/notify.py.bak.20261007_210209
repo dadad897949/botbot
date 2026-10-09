@@ -1,0 +1,778 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""通知集合 —— Bot 通知、取消按钮、滚动显示、24h 删除。
+
+VERSION = "1.5.5"  # 2026-10-06: 任务完成删开始消息，不残留  # 2026-10-06: /doctor 加 Reflect 洞察  # 2026-10-06: 修清空聊天内联按钮未知操作
+"""
+VERSION = "1.5.5"  # 2026-10-06: 任务完成删开始消息，不残留  # 2026-10-06: /doctor 加 Reflect 洞察  # 2026-10-06: 修清空聊天内联按钮未知操作
+
+import asyncio
+
+# 由 runner.init_notify() 注入
+_bot_client = None
+_owner_id = None
+_cancel_fn = None
+_retry_fn = None
+_tele_button = None
+
+# 批量任务：batch_id -> [task_key, ...]
+_batch_tasks = {}
+
+# 滚动通知：只保留最新一条完成通知
+_last_done_msg = None
+
+
+_tasks_mod = None
+_history_mod = None
+
+_batch_status_fn = None
+
+def init(bot_client, owner_id, cancel_fn, tele_button, tasks_mod=None, history_mod=None, retry_fn=None, batch_status_fn=None):
+    """初始化通知模块。runner 启动时调用一次"""
+    global _bot_client, _owner_id, _cancel_fn, _tele_button
+    global _tasks_mod, _history_mod, _retry_fn, _batch_status_fn
+    _bot_client = bot_client
+    _owner_id = owner_id
+    _cancel_fn = cancel_fn
+    _tele_button = tele_button
+    _tasks_mod = tasks_mod
+    _history_mod = history_mod
+    _retry_fn = retry_fn
+    _batch_status_fn = batch_status_fn
+
+
+async def bot_notify(text, buttons=None):
+    """发通知到 bot，返回 message 对象（供后续编辑）"""
+    if _bot_client is None:
+        return None
+    try:
+        return await _bot_client.send_message(_owner_id, text, buttons=buttons)
+    except Exception as e:
+        print('BOT_NOTIFY_FAIL: %r' % e, flush=True)
+        return None
+
+
+def cancel_button(key):
+    """生成取消按钮。key: 任务 key 或 batch:<batch_id>。
+    callback_data 带 owner_id，防陌生人点击（按文章方案）。"""
+    data = 'cancel:%s:%s' % (_owner_id, key)
+    # 64 字节限制：key 太长则截断（batch_id 短，任务 key 是 chat_id_msgid，可控）
+    if len(data.encode()) > 64:
+        data = data[:64]
+    return [[_tele_button.inline('❌ 取消', data=data.encode())]]
+
+
+def retry_button(retry_id, fail_count):
+    """生成重试按钮"""
+    data = 'retry:%s:%s' % (_owner_id, retry_id)
+    if len(data.encode()) > 64:
+        data = data[:64]
+    return [[_tele_button.inline('🔄 重试失败 (%d)' % fail_count, data=data.encode())]]
+
+
+def batch_register(batch_id, key):
+    """把任务 key 注册到批量里，用于一键取消"""
+    if batch_id and key:
+        _batch_tasks.setdefault(batch_id, []).append(key)
+
+
+def batch_pop(batch_id):
+    """取出并删除批量任务记录"""
+    return _batch_tasks.pop(batch_id, None)
+
+
+async def bot_edit(msg, text, buttons='KEEP'):
+    """编辑 bot 通知消息。buttons='KEEP' 不动按钮，None 清除，列表则设置"""
+    if msg is not None:
+        try:
+            if buttons == 'KEEP':
+                await msg.edit(text)
+            else:
+                await msg.edit(text, buttons=buttons)
+            return msg
+        except Exception:
+            pass
+    return await bot_notify(text, buttons=None if buttons == 'KEEP' else buttons)
+
+
+def schedule_bot_delete(msg, delay=86400):
+    """24小时后删除 bot 消息"""
+    if msg is None:
+        return
+
+    def _do():
+        try:
+            asyncio.create_task(msg.delete())
+        except Exception:
+            pass
+    try:
+        asyncio.get_event_loop().call_later(delay, _do)
+    except Exception:
+        pass
+
+
+def get_last_done_msg():
+    return _last_done_msg
+
+
+def set_last_done_msg(msg):
+    global _last_done_msg
+    _last_done_msg = msg
+
+
+async def reply_autodelete(event, ack, text, delay=86400, buttons=None):
+    """汇总通知：删除旧的 ack（任务开始消息），发新的汇总，24h后删除。
+    buttons=None 清按钮，传入则设置（用于重试按钮）。"""
+    # 先删掉"任务开始"消息，避免残留
+    try:
+        if ack:
+            await ack.delete()
+    except Exception:
+        pass
+    _m = await bot_notify(text, buttons=buttons)
+    schedule_bot_delete(_m, delay)
+    return None
+
+
+def main_keyboard():
+    """常驻输入栏键盘（ReplyKeyboardMarkup）"""
+    from telethon import Button as _B
+    return [
+        [_B.text('📊 状态'), _B.text('📜 历史')],
+        [_B.text('❌ 取消所有'), _B.text('🧹 清理')],
+        [_B.text('💾 网盘'), _B.text('🤖 取文件')],
+        [_B.text('▶️ 91porn运行'), _B.text('⏹️ 91porn取消')],
+        [_B.text('💬 评论区'), _B.text('📊 评论进度')],
+        [_B.text('🗑️ 清空聊天'), _B.text('📋 菜单')],
+    ]
+
+
+async def set_bot_commands(bot_client):
+    """设置 bot 命令列表，输入 / 时显示快捷候选"""
+    try:
+        from telethon import functions, types
+        await bot_client(functions.bots.SetBotCommandsRequest(
+            scope=types.BotCommandScopeDefault(),
+            lang_code='',
+            commands=[
+                types.BotCommand(command='menu', description='打开快捷菜单'),
+                types.BotCommand(command='stats', description='查看传输状态'),
+                types.BotCommand(command='history', description='查看历史记录'),
+                types.BotCommand(command='drive', description='查看网盘信息'),
+                types.BotCommand(command='clean', description='清理缓存'),
+                types.BotCommand(command='getbot', description='从 bot 取文件（简写 /gb）'),
+                types.BotCommand(command='getcomments', description='下载评论区内容（简写 /gc）'),
+                types.BotCommand(command='gcstatus', description='查看评论进度'),
+                types.BotCommand(command='status', description='查看转存状态'),
+                types.BotCommand(command='alipanlogin', description='阿里云盘登录'),
+                types.BotCommand(command='doctor', description='检查系统状态'),
+                types.BotCommand(command='clearchat', description='清空聊天'),
+            ]
+        ))
+        print('BOT_COMMANDS_SET OK', flush=True)
+    except Exception as e:
+        print('BOT_COMMANDS_SET_FAIL: %r' % e, flush=True)
+    # 左下角"菜单"按钮 → 点一下直接弹命令列表
+    try:
+        from telethon import functions, types
+        await bot_client(functions.bots.SetBotMenuButtonRequest(
+            user_id=types.InputUserSelf(),
+            button=types.BotMenuButtonCommands(),
+        ))
+        print('BOT_MENU_BUTTON_SET OK', flush=True)
+    except Exception as e:
+        print('BOT_MENU_BUTTON_SET_FAIL: %r' % e, flush=True)
+
+
+def register_cancel_handler(bot_client, tele_events):
+    """注册取消按钮回调 + /menu 命令。bot_client 初始化后调用"""
+
+    import os as _os, json as _js
+    _menu_id_file = '/tmp/tg_menu_msg.json'
+    def _get_menu_id():
+        try:
+            with open(_menu_id_file) as f:
+                return _js.load(f).get('id')
+        except Exception:
+            return None
+    def _set_menu_id(mid):
+        try:
+            with open(_menu_id_file, 'w') as f:
+                _js.dump({'id': mid}, f)
+        except Exception:
+            pass
+
+    _stats_id_file = '/tmp/tg_stats_msg.json'
+    def _get_stats_id():
+        try:
+            with open(_stats_id_file) as f:
+                import json as _js3
+                return _js3.load(f).get('id')
+        except Exception:
+            return None
+    def _set_stats_id(mid):
+        try:
+            with open(_stats_id_file, 'w') as f:
+                import json as _js3
+                _js3.dump({'id': mid}, f)
+        except Exception:
+            pass
+
+    @bot_client.on(tele_events.NewMessage(pattern=r'^/(stats|status|st)$'))
+    async def _on_stats_cmd(ev):
+        # 只响应 owner
+        if str(getattr(ev, 'sender_id', '')) != str(_owner_id):
+            return
+        from telethon import Button as _B
+        try:
+            n_active = len(_tasks_mod.active) if _tasks_mod else 0
+            lines = ['📊 当前 %d 个传输中' % n_active]
+            # 批量任务整体进度
+            if _batch_status_fn:
+                for bid, bs in _batch_status_fn().items():
+                    done = len(bs.get('details', []))
+                    total = bs.get('total', 0)
+                    label = bs.get('label', bid)
+                    if total > 0:
+                        lines.append('📦 %s：%d/%d' % (label, done, total))
+            text = '\n'.join(lines)
+            buttons = [[_B.inline('❌ 关闭', data=('stats:%s:close' % _owner_id).encode())]]
+            # 复用 menu 方式：删旧消息
+            _sid = _get_stats_id()
+            if _sid:
+                try:
+                    await bot_client.delete_messages(ev.chat_id, [_sid])
+                except Exception:
+                    pass
+            msg = await ev.reply(text, buttons=buttons)
+            _set_stats_id(msg.id)
+            try:
+                await ev.delete()
+            except Exception:
+                pass
+        except Exception as e:
+            await ev.reply('查询失败：%s' % str(e)[:60])
+
+    @bot_client.on(tele_events.CallbackQuery(pattern=b'^stats:'))
+    async def _on_stats_close(ev):
+        try:
+            parts = ev.data.decode().split(':', 2)
+            if len(parts) != 3:
+                return
+            uid, action = parts[1], parts[2]
+            if str(getattr(ev, 'sender_id', '')) != str(uid) or str(uid) != str(_owner_id):
+                await ev.answer('无权操作', alert=True)
+                return
+            if action == 'close':
+                try:
+                    await ev.delete()
+                except Exception:
+                    pass
+                await ev.answer('已关闭')
+        except Exception:
+            pass
+
+    _hist_id_file = '/tmp/tg_history_msg.json'
+    def _get_hist_id():
+        try:
+            with open(_hist_id_file) as f:
+                import json as _js2
+                return _js2.load(f).get('id')
+        except Exception:
+            return None
+    def _set_hist_id(mid):
+        try:
+            with open(_hist_id_file, 'w') as f:
+                import json as _js2
+                _js2.dump({'id': mid}, f)
+        except Exception:
+            pass
+
+    @bot_client.on(tele_events.NewMessage(pattern=r'^/(history|hist|log)$'))
+    async def _on_history_cmd(ev):
+        if str(getattr(ev, 'sender_id', '')) != str(_owner_id):
+            return
+        from telethon import Button as _B
+        try:
+            recs = _history_mod.read_history(30) if _history_mod else []
+            if not recs:
+                text = '📜 暂无传输记录'
+            else:
+                lines = ['📜 最近传输记录：']
+                for r in reversed(recs):
+                    mark = '✅' if r.get('result') == 'ok' else '❌'
+                    if r.get('result') == 'ok':
+                        lines.append('%s %s %s' % (mark, r.get('ts', ''), r.get('folder', '')))
+                    else:
+                        lines.append('%s %s 失败：%s' % (mark, r.get('ts', ''), r.get('error', '')[:40]))
+                text = '\n'.join(lines)
+            buttons = [[_B.inline('❌ 关闭', data=('hist:%s:close' % _owner_id).encode())]]
+            # 删旧消息（复用 menu 方式）
+            _hid = _get_hist_id()
+            if _hid:
+                try:
+                    await bot_client.delete_messages(ev.chat_id, [_hid])
+                except Exception:
+                    pass
+            msg = await ev.reply(text, buttons=buttons)
+            _set_hist_id(msg.id)
+            try:
+                await ev.delete()
+            except Exception:
+                pass
+        except Exception as e:
+            await ev.reply('查询失败：%s' % str(e)[:60])
+
+    @bot_client.on(tele_events.CallbackQuery(pattern=b'^hist:'))
+    async def _on_hist_close(ev):
+        try:
+            parts = ev.data.decode().split(':', 2)
+            if len(parts) != 3:
+                return
+            uid, action = parts[1], parts[2]
+            if str(getattr(ev, 'sender_id', '')) != str(uid) or str(uid) != str(_owner_id):
+                await ev.answer('无权操作', alert=True)
+                return
+            if action == 'close':
+                try:
+                    await ev.delete()
+                except Exception:
+                    pass
+                await ev.answer('已关闭')
+        except Exception:
+            pass
+
+    @bot_client.on(tele_events.NewMessage(pattern=r'^/(menu|m)$'))
+    async def _on_menu_cmd(ev):
+        # 只响应 owner
+        if str(getattr(ev, 'sender_id', '')) != str(_owner_id):
+            return
+        from telethon import Button as _B
+        buttons = [
+            [_B.inline('📊 状态', data=('menu:%s:status' % _owner_id).encode()),
+             _B.inline('📜 历史', data=('menu:%s:history' % _owner_id).encode())],
+            [_B.inline('❌ 取消所有', data=('menu:%s:cancel_all' % _owner_id).encode()),
+             _B.inline('🧹 清理', data=('menu:%s:clean' % _owner_id).encode())],
+            [_B.inline('💾 网盘', data=('menu:%s:drive' % _owner_id).encode()),
+             _B.inline('🤖 取文件', data=('menu:%s:getbot' % _owner_id).encode())],
+            [_B.inline('▶️ 91porn运行', data=('menu:%s:p91run' % _owner_id).encode()),
+             _B.inline('⏹️ 91porn取消', data=('menu:%s:p91stop' % _owner_id).encode())],
+            [_B.inline('💬 评论区', data=('menu:%s:getcomments' % _owner_id).encode()),
+             _B.inline('📊 评论进度', data=('menu:%s:gcstatus' % _owner_id).encode())],
+            [_B.inline('🗑️ 清空聊天', data=('menu:%s:clearchat' % _owner_id).encode())],
+        ]
+        # 删掉旧菜单，发新的（保证按钮一定在）
+        _menu_msg_id = _get_menu_id()
+        if _menu_msg_id:
+            try:
+                await bot_client.delete_messages(ev.chat_id, [_menu_msg_id])
+            except Exception:
+                pass
+        msg = await ev.reply('🎛️ 快捷菜单', buttons=buttons)
+        _set_menu_id(msg.id)
+        # 顺带发送常驻输入栏键盘
+        try:
+            await bot_client.send_message(ev.chat_id, '⌨️ 输入栏按钮已就绪', buttons=main_keyboard())
+        except Exception:
+            pass
+        try:
+            await ev.delete()
+        except Exception:
+            pass
+
+    @bot_client.on(tele_events.NewMessage(pattern=r'^/(doctor|doc)$'))
+    async def _on_doctor_cmd(ev):
+        """系统体检：学 Agent-Reach 的 doctor 模式，一条命令看所有状态。"""
+        if str(getattr(ev, 'sender_id', '')) != str(_owner_id):
+            return
+        lines = ['🩺 系统体检']
+        # 1. Session 健康
+        try:
+            from tg_bot import health as _hl
+            h = _hl.get_health()
+            for name, st in h.items():
+                icon = '✅' if st['ok'] else '❌'
+                lines.append('%s %s (失败%d次，重连%d次)' % (
+                    icon, name, st['fails'], st['reconnects']))
+        except Exception as e:
+            lines.append('❌ 健康检查模块异常：%s' % str(e)[:40])
+        # 2. 阿里云盘（放线程池，避免阻塞事件循环）
+        try:
+            import asyncio as _aio
+            from tg_bot import alipan as _ap
+            def _probe():
+                try:
+                    _ap.get_ali()
+                    return None
+                except Exception as e:
+                    return type(e).__name__
+            err = await _aio.wait_for(
+                _aio.to_thread(_probe), timeout=35)
+            if err is None:
+                lines.append('✅ 阿里云盘登录正常')
+            else:
+                lines.append('❌ 阿里云盘：%s' % err)
+        except Exception as e:
+            lines.append('❌ 阿里云盘检查超时')
+        # 3. 磁盘空间
+        try:
+            import shutil as _sh
+            total, used, free = _sh.disk_usage('/')
+            lines.append('💾 磁盘：可用 %.1fG / 总 %.1fG' % (
+                free / 1073741824, total / 1073741824))
+        except Exception:
+            lines.append('❌ 磁盘检查失败')
+        # 4. 任务状态
+        try:
+            n = len(_tasks_mod.active) if _tasks_mod else 0
+            lines.append('📊 活动任务：%d' % n)
+        except Exception:
+            pass
+        # 5. Hindsight Reflect: 学习洞察
+        try:
+            from tg_bot import learnings as _ln
+            for _src in ('收藏夹',):
+                _insight = _ln.reflect(_src)
+                if _insight:
+                    lines.append(_insight)
+        except Exception:
+            pass
+        try:
+            await ev.reply('\n'.join(lines))
+            await ev.delete()
+        except Exception:
+            pass
+
+    # 输入栏键盘按钮映射
+    _KB_MAP = {
+        '📊 状态': '/stats',
+        '📜 历史': '/history',
+        '❌ 取消所有': '/cancel_all',
+        '🧹 清理': '/clean',
+        '💾 网盘': '/drive',
+        '🤖 取文件': '/getbot',
+        '▶️ 91porn运行': '/p91run',
+        '⏹️ 91porn取消': '/p91stop',
+        '💬 评论区': '/getcomments',
+        '📊 评论进度': '/gcstatus',
+        '🗑️ 清空聊天': '/clearchat',
+        '📋 菜单': '/menu',
+    }
+
+    @bot_client.on(tele_events.NewMessage)
+    async def _on_keyboard_btn(ev):
+        # 只处理键盘按钮文本
+        text = (ev.message.text or '').strip()
+        if text not in _KB_MAP:
+            return
+        if str(getattr(ev, 'sender_id', '')) != str(_owner_id):
+            return
+        # 模拟对应命令
+        # 构造一个假的 event 调用对应 handler
+        # 简化：直接发送命令文本让正常流程处理
+        try:
+            await ev.delete()
+        except Exception:
+            pass
+        # 用 bot_client 自己发命令（会触发对应的 NewMessage handler）
+        # 注意：sender 是 bot 自己，需要特殊处理
+        # 改为直接调用逻辑
+        cmd = _KB_MAP[text]
+        if cmd == '/stats':
+            # 触发 stats 逻辑（复用）
+            await _on_stats_cmd(ev)
+        elif cmd == '/history':
+            await _on_history_cmd(ev)
+        elif cmd == '/menu':
+            await _on_menu_cmd(ev)
+        else:
+            # 其他按钮复用 _menu_action_text（去掉开头的 /）
+            action = cmd.lstrip('/')
+            # clearchat 需要删消息，特殊处理（用用户号，bot 号受限）
+            if action == 'clearchat':
+                try:
+                    from tg_bot import handlers as _h
+                    _uclient = _h._client
+                    if not _uclient:
+                        await ev.reply('清空失败：用户号未初始化')
+                        return
+                    _deleted = 0
+                    _me = await bot_client.get_me()
+                    # 和 bot 的私聊，对用户号来说 chat 就是 bot 本人
+                    _bot_id = _me.id
+                    async for _m in _uclient.iter_messages(_bot_id, limit=500):
+                        try:
+                            await _uclient.delete_messages(_bot_id, _m.id)
+                            _deleted += 1
+                        except Exception as _de:
+                            pass
+                    await ev.reply('🗑️ 已删除 %d 条消息' % _deleted)
+                except Exception as e:
+                    await ev.reply('清空失败：%s' % str(e)[:100])
+                return
+            # 映射命令到 action 名
+            _cmd_to_action = {
+                'cancel_all': 'cancel_all', 'clean': 'clean', 'drive': 'drive',
+                'getbot': 'getbot', 'p91run': 'p91run', 'p91stop': 'p91stop',
+                'getcomments': 'getcomments', 'gcstatus': 'gcstatus',
+            }
+            text = await _menu_action_text(_cmd_to_action.get(action, action))
+            await ev.reply(text)
+
+    @bot_client.on(tele_events.CallbackQuery(pattern=b'^retry:'))
+    async def _on_retry(ev):
+        try:
+            parts = ev.data.decode().split(':', 2)
+            if len(parts) != 3:
+                await ev.answer('参数错误')
+                return
+            uid, retry_id = parts[1], parts[2]
+            if str(getattr(ev, 'sender_id', '')) != str(uid) or str(uid) != str(_owner_id):
+                await ev.answer('无权操作', alert=True)
+                return
+            if _retry_fn:
+                ok = await _retry_fn(retry_id, ev)
+                await ev.answer('已开始重试' if ok else '重试记录已过期')
+            else:
+                await ev.answer('重试功能未初始化')
+        except Exception as e:
+            print('RETRY_CB_FAIL: %r' % e, flush=True)
+            try:
+                await ev.answer('重试失败')
+            except Exception:
+                pass
+
+    @bot_client.on(tele_events.CallbackQuery(pattern=b'^cancel:'))
+    async def _on_cancel(ev):
+        try:
+            parts = ev.data.decode().split(':', 2)
+            if len(parts) != 3:
+                await ev.answer('参数错误')
+                return
+            uid, key = parts[1], parts[2]
+            # 校验点击者是 owner
+            if str(getattr(ev, 'sender_id', '')) != str(uid) or str(uid) != str(_owner_id):
+                await ev.answer('无权操作', alert=True)
+                return
+            if key.startswith('batch:'):
+                batch_id = key[6:]
+                keys = _batch_tasks.pop(batch_id, [])
+                ok = sum(1 for k in keys if _cancel_fn(k)) if _cancel_fn else 0
+                await ev.answer('已取消 %d 个任务' % ok if ok else '任务已结束')
+                if ok:
+                    try:
+                        await ev.edit('❌ 已取消（批量）', buttons=None)
+                        _m = await ev.get_message()
+                        schedule_bot_delete(_m, 86400)
+                    except Exception:
+                        pass
+            else:
+                # getbot 任务用 flag 机制
+                if key.startswith('getbot'):
+                    try:
+                        from tg_bot import handlers as _h
+                        ok = _h.cancel_getbot(key)
+                    except Exception:
+                        ok = False
+                else:
+                    ok = _cancel_fn(key) if _cancel_fn else False
+                await ev.answer('已取消' if ok else '任务已结束或不存在')
+        except Exception as e:
+            try:
+                await ev.answer('取消失败')
+            except Exception:
+                pass
+            print('CANCEL_BTN_FAIL: %r' % e, flush=True)
+
+
+    # 菜单动作的公共逻辑（内联按钮和键盘按钮复用）
+    async def _menu_action_text(action):
+        """返回对应动作的文本，复用逻辑不重复写"""
+        if action == 'status':
+            from tg_bot import tasks as _tm
+            lines = ['📊 当前传输：%d 个' % len(_tm.active)]
+            for key in list(_tm.active):
+                st = _tm.active.get(key)
+                if st and not st.get('placeholder'):
+                    lines.append('• %s' % st.get('label', key)[:30])
+            return '\n'.join(lines)
+        elif action == 'cancel_all':
+            from tg_bot import tasks as _tm
+            n = 0
+            for key in list(_tm.active):
+                if _cancel_fn and _cancel_fn(key):
+                    n += 1
+            return '已取消 %d 个任务' % n if n else '没有运行中的任务'
+        elif action == 'p91run':
+            import subprocess
+            subprocess.run(['systemctl', 'stop', '91porn.service'], timeout=5, capture_output=True)
+            subprocess.run(['systemctl', 'start', '--no-block', '91porn.service'], timeout=5, capture_output=True)
+            return '91porn 已启动'
+        elif action == 'p91stop':
+            import subprocess
+            subprocess.run(['systemctl', 'stop', '91porn.service'], timeout=10, capture_output=True)
+            return '91porn 已取消'
+        elif action == 'history':
+            recs = _history_mod.read_history(5) if _history_mod else []
+            if not recs:
+                return '暂无记录'
+            lines = []
+            for r in reversed(recs):
+                mark = '✅' if r.get('result') == 'ok' else '❌'
+                lines.append('%s %s %s' % (mark, r.get('ts', ''), r.get('folder', '')[:20]))
+            return '\n'.join(lines)
+        elif action == 'clean':
+            # 直接清理，不推给收藏夹
+            try:
+                import os as _os, glob as _glob
+                _tmp = '/tmp'
+                _n = 0
+                for _f in _glob.glob(_os.path.join(_tmp, 'tg_*')):
+                    try:
+                        _os.remove(_f)
+                        _n += 1
+                    except Exception:
+                        pass
+                return '已清理 %d 个临时文件' % _n if _n else '没有可清理的临时文件'
+            except Exception as e:
+                return '清理失败：%r' % e
+        elif action == 'drive':
+            # 直接查网盘状态，不推给收藏夹
+            try:
+                from tg_bot import cloud as _cm
+                import asyncio as _aio
+                lines = ['🌐 当前网盘：%s' % ' + '.join(_cm.labels())]
+                _hs = await _aio.get_event_loop().run_in_executor(None, _cm.health)
+                for _k, _lab, _ok, _why in _hs:
+                    lines.append('%s %s%s' % ('✅' if _ok else '❌', _lab,
+                                              '' if _ok else '：%s' % _why))
+                lines.append('当前只有阿里云盘')
+                return '\n'.join(lines)
+            except Exception as e:
+                return '网盘状态获取失败：%r' % e
+        elif action == 'getbot':
+            return '用法：/getbot @bot用户名 口令\n或直接发 t.me 机器人链接'
+        elif action == 'getcomments':
+            return '用法：\n/getcomments https://t.me/频道名/123\n下载该帖评论区的视频/图片'
+        elif action == 'gcstatus':
+            from tg_bot import handlers as _h
+            _st = _h.get_gc_status()
+            if not _st:
+                return '暂无评论拉取任务'
+            import time as _t
+            _phase = _st.get('phase', '?')
+            _batches = _st.get('batches', 0)
+            _found = _st.get('found', 0)
+            _post = _st.get('post_id', '?')
+            _elapsed = int(_t.time() - _st.get('start_ts', _t.time()))
+            _phase_txt = {'scanning': '🔍 扫描中', 'scan_done': '✅ 扫描完成'}.get(_phase, _phase)
+            return ('💬 评论拉取状态\n帖子: %s\n状态: %s\n已扫: %d 批\n找到: %d 个媒体\n用时: %d 秒' % (
+                _post, _phase_txt, _batches, _found, _elapsed))
+        return '未知操作'
+
+    @bot_client.on(tele_events.CallbackQuery(pattern=b'^menu:'))
+    async def _on_menu(ev):
+        """快捷菜单按钮回调"""
+        try:
+            parts = ev.data.decode().split(':', 2)
+            if len(parts) != 3:
+                await ev.answer('参数错误')
+                return
+            uid, action = parts[1], parts[2]
+            if str(getattr(ev, 'sender_id', '')) != str(uid) or str(uid) != str(_owner_id):
+                await ev.answer('无权操作', alert=True)
+                return
+            # clearchat 需要删消息，特殊处理（用用户号，bot 号受限）
+            # 不能走 _menu_action_text（那只返回文本），这里要实际执行删除
+            if action == 'clearchat':
+                try:
+                    from tg_bot import handlers as _h
+                    _uclient = _h._client
+                    if not _uclient:
+                        await ev.answer('清空失败：用户号未初始化', alert=True)
+                        return
+                    _deleted = 0
+                    _me = await bot_client.get_me()
+                    _bot_id = _me.id
+                    async for _m in _uclient.iter_messages(_bot_id, limit=500):
+                        try:
+                            await _uclient.delete_messages(_bot_id, _m.id)
+                            _deleted += 1
+                        except Exception:
+                            pass
+                    await ev.answer('🗑️ 已删除 %d 条消息' % _deleted, alert=True)
+                except Exception as e:
+                    await ev.answer('清空失败：%s' % str(e)[:100], alert=True)
+                return
+            text = await _menu_action_text(action)
+            await ev.answer(text, alert=True)
+        except Exception as e:
+            try:
+                await ev.answer('操作失败')
+            except Exception:
+                pass
+            print('MENU_BTN_FAIL: %r' % e, flush=True)
+
+
+def batch_init(batch_id, keys=None):
+    """初始化批量任务记录"""
+    _batch_tasks[batch_id] = keys if keys is not None else []
+
+
+def _fmt_size(n):
+    if n >= 1073741824:
+        return '%.1fGB' % (n / 1073741824)
+    return '%.0fMB' % (n / 1048576)
+
+
+def build_summary(ok_count, total, details, elapsed_sec, label):
+    """构建转存完成汇总消息（精简版）。
+
+    不列单个文件名，只给总数+图片/视频拆分+用时。
+    失败时才列失败文件名。
+
+    details: [{'name', 'size', 'parts', 'folder', 'duration'}, ...]
+    label: 类型标签，必填，如 '转存'、'评论转存'、'链接转存'、'取文件'
+    """
+    fail_count = total - ok_count
+
+    # 图片/视频拆分（优先用 is_photo 字段，兼容旧的文件名前缀判断）
+    ok_photo = sum(1 for d in details if d.get('is_photo') or d.get('name', '').startswith('photo_'))
+    ok_video = ok_count - ok_photo
+
+    # 用时格式化
+    if elapsed_sec > 0:
+        sec = int(elapsed_sec)
+        if sec < 60:
+            t = '%d秒' % sec
+        else:
+            m, s = divmod(sec, 60)
+            t = '%d分%02d秒' % (m, s) if m < 60 else '%d小时%02d分' % (m // 60, m % 60)
+    else:
+        t = ''
+
+    # 文件夹
+    folder = details[0].get('folder', '') if details else ''
+
+    if fail_count == 0:
+        lines = ['✅ %s完成 %d/%d' % (label, ok_count, total)]
+        if folder:
+            lines.append('📁 %s' % folder)
+        if t:
+            lines.append('⏱ 用时 %s' % t)
+        lines.append('📷 图片 %d · 🎬 视频 %d' % (ok_photo, ok_video))
+    else:
+        if ok_count == 0:
+            lines = ['❌ %s失败 %d/%d' % (label, ok_count, total)]
+        else:
+            lines = ['⚠️ %s完成 %d/%d（%d 失败）' % (label, ok_count, total, fail_count)]
+        if folder:
+            lines.append('📁 %s' % folder)
+        if t:
+            lines.append('⏱ 用时 %s' % t)
+        lines.append('📷 图片 %d · 🎬 视频 %d' % (ok_photo, ok_video))
+        # 失败才列文件名（最多 5 个）
+        # 注意：details 只含成功的，失败的需要调用方传入，这里只显示占位
+        # 调用方如需列失败名，请自行拼接
+
+    return '\n'.join(lines)

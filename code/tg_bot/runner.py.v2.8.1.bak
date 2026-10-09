@@ -1,0 +1,675 @@
+"""Telegram -> AliyunDrive bot (portable).
+VERSION = "2.8.1"  # 2026-10-06: 加 /gcstatus 命令（双端）  # 2026-10-06: session健康检查+结构化日志
+BASE_DIR: env BOT_DIR or the script's own directory.
+"""
+VERSION = "2.8.1"  # 2026-10-06: 加 /gcstatus 命令（双端）  # 2026-10-06: session健康检查+结构化日志
+
+import json, asyncio, os, re, sys, time, threading
+from datetime import datetime
+from urllib.parse import urlparse
+
+BASE_DIR = os.environ.get('BOT_DIR') or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, BASE_DIR)
+from tg_bot.alipan import get_ali, ensure_folder, ensure_subfolder, sanitize
+from tg_bot import transfer
+from tg_bot import cloud as cloudmod
+from tg_bot.transfer import record_sample
+from tg_bot import dashboard
+from tg_bot import fastdl, notify, tasks, history, handlers
+from tg_bot import health, jlog
+
+# Bot 通知客户端（全局，health 检查用）
+_bot_client = None
+
+INBOX = os.path.join(BASE_DIR, 'bot_inbox')
+
+# 相册分组：grouped_id -> 首次收到时间，用于 30 秒窗口聚合
+_pending_albums = {}
+
+proxy = None
+pu = urlparse(os.environ.get('https_proxy') or os.environ.get('http_proxy') or '')
+if pu.hostname:
+    proxy = ('http', pu.hostname, pu.port or 8080, True, pu.username, pu.password)
+from telethon.errors import FloodWaitError
+from telethon import events as _tele_events, Button as _tele_Button, TelegramClient
+
+cfg = json.load(open(os.path.join(BASE_DIR, 'config', 'bot_config.json')))
+tgcfg = json.load(open(os.path.join(BASE_DIR, 'config', 'tg_config.json')))
+API_ID, API_HASH = tgcfg['api_id'], tgcfg['api_hash']
+OWNER = cfg['owner_id']
+OWNER_ID = 0  # main() 中会更新为实际的用户 ID
+BOT_TOKEN = cfg.get('bot_token')
+
+# Bot 通知客户端（2026-10-04：转存通知走 bot，收藏夹不留通知）
+
+async def progress_notifier(client):
+    # H3: 首次播报从 10 分钟提前到 2 分钟，避免用户以为机器人死了
+    await asyncio.sleep(120)  # first report after 2 min, only if still busy
+    while True:
+        if tasks.active:
+            lines = []
+            for key in list(tasks.active):
+                st = tasks.active.get(key)
+                if st is None:
+                    continue
+                phase = st.get('phase', '传输中')
+                prog = tasks.progress_of(key)
+                if prog is None:
+                    continue
+                lines.append('⏳ %s：%s' % (phase, prog))
+            try:
+                await client.send_message(OWNER, '\n'.join(lines))
+            except Exception:
+                pass
+        await asyncio.sleep(600)
+
+
+async def main():
+    # 初始化各集合模块
+    HISTORY_FILE = os.path.join(BASE_DIR, 'history.jsonl')
+    tasks.init(INBOX)
+    history.init(HISTORY_FILE, tasks, transfer)
+    # handlers 的 init 需要 client，稍后在 client 创建后调用
+    # 启动清理：有 resume 状态的文件保留（断点续传），其余残留清掉
+    # 用 resume.json 里的精确 path 匹配（key 子串匹配有误判风险，已去掉）
+    try:
+        resumable_paths = set()
+        for rf in os.listdir(INBOX):
+            if rf.endswith('.resume.json'):
+                try:
+                    with open(os.path.join(INBOX, rf)) as jf:
+                        _rs = json.load(jf)
+                        if _rs.get('path'):
+                            resumable_paths.add(_rs['path'])
+                except (OSError, ValueError):
+                    pass
+        stale = []
+        kept = 0
+        for f in os.listdir(INBOX):
+            fp = os.path.join(INBOX, f)
+            if not os.path.isfile(fp):
+                continue
+            if f.endswith('.resume.json'):
+                continue
+            if fp in resumable_paths:
+                kept += 1
+            else:
+                stale.append(f)
+        for f in stale:
+            try:
+                os.remove(os.path.join(INBOX, f))
+            except OSError:
+                pass
+        if stale:
+            print('STARTUP_CLEAN removed %d stale files' % len(stale), flush=True)
+        if kept:
+            print('STARTUP_KEEP %d resumable files' % kept, flush=True)
+    except OSError as e:
+        print('STARTUP_CLEAN_FAIL %s' % e, flush=True)
+    client = TelegramClient(os.path.join(BASE_DIR, 'user_session'),
+                            API_ID, API_HASH, proxy=proxy)
+    # 初始化消息处理模块（需要 client）
+    handlers.init(client, OWNER, INBOX, BASE_DIR, transfer, cloudmod,
+                  fastdl, notify, tasks, history, API_ID, API_HASH, proxy)
+    # 用户身份登录（2026-10-02 改为同步收藏夹）：用已保存的 user_session，
+    # 不再用 bot_token
+    # handler 必须在 start() 之前注册，否则收不到更新
+    @client.on(_tele_events.NewMessage)
+    async def on_msg(event):
+        # 用户模式：只处理自己发出的消息（收藏夹同步 + 命令）
+        if event.sender_id != OWNER_ID:
+            return
+        # 2026-10-05: 收藏夹不通知，所有回复转到 bot
+        async def _reply(text=None, file=None, message=None):
+            try:
+                txt = text if text is not None else message
+                if file:
+                    await notify._bot_client.send_file(OWNER_ID, file, caption=txt)
+                else:
+                    await notify.bot_notify(txt)
+            except Exception as e:
+                print('BOT_REPLY_FAIL: %r' % e, flush=True)
+        msg = event.message
+        # 收藏夹（Saved Messages）：chat_id == 自己的 id
+        is_saved = event.chat_id == OWNER_ID
+        # 只在收藏夹响应，避免在其他机器人/群聊里发 /stats 等被误触发
+        if not is_saved:
+            return
+        if msg.text == '/start':
+            await _reply(
+                '收藏夹同步已开启。把视频/图片发到收藏夹，我自动存到网盘。\n'
+                '当前网盘：%s\n'
+                '20分钟以下进「短视频/」，20分钟以上建独立中文文件夹。\n'
+                '命令：/drive 看/切网盘，/alipanlogin 阿里云盘扫码登录，'
+                '/stats 传输状态，/history 最近记录，/clean 清理异常记录。\n'
+                '/getbot @bot用户名 口令 —— 从防转发的 bot 取文件。'
+                % ' + '.join(cloudmod.labels()))
+            return
+        if msg.text == '/alipanlogin':
+            await _reply('🔐 正在生成阿里云盘登录二维码，马上发到你这里…')
+            loop3 = asyncio.get_event_loop()
+
+            async def _send_qr(png_path, caption):
+                try:
+                    await _reply(file=png_path, message=caption)
+                except Exception as e:
+                    print('ALIPAN_QR_TG_SEND_FAIL %r' % e, flush=True)
+
+            def _do_alipan_login():
+                from tg_bot import alipan_login
+                return alipan_login.login_qr_loop(
+                    send_tg_fn=_send_qr, main_loop=loop3)
+
+            async def _alipan_login_runner():
+                try:
+                    await loop3.run_in_executor(None, _do_alipan_login)
+                    await _reply('✅ 阿里云盘已接上，机器人可以往阿里云盘传文件了。')
+                except Exception as e:
+                    await _reply('❌ 阿里云盘登录失败：%s' % str(e)[:160])
+            tasks.spawn(_alipan_login_runner(), 'alipan_login')
+            return
+        if msg.text.startswith('/drive') or msg.text.strip() == '/d':
+            _parts = msg.text.split()
+            if len(_parts) == 1:
+                lines = ['🌐 当前网盘：%s' % ' + '.join(cloudmod.labels())]
+                try:
+                    _hs = await asyncio.get_event_loop().run_in_executor(
+                        None, cloudmod.health)
+                    for _k, _lab, _ok, _why in _hs:
+                        lines.append('%s %s%s' % ('✅' if _ok else '❌', _lab,
+                                                  '' if _ok else '：%s' % _why))
+                except Exception as e:
+                    lines.append('探测失败：%r' % (e,))
+                lines.append('当前只有阿里云盘')
+                await _reply('\n'.join(lines))
+                return
+            _arg = _parts[1].lower()
+            if _arg == 'both':
+                _keys = ['ali']
+            elif _arg in cloudmod.KEYS:
+                _keys = [_arg]
+            else:
+                await _reply('用法：/drive ali')
+                return
+            try:
+                _keys = cloudmod.set_targets(_keys)
+            except Exception as e:
+                await _reply('❌ 切换失败：%s' % str(e)[:120])
+                return
+            await _reply('✅ 已切换到：%s'
+                              % ' + '.join(cloudmod.labels(_keys)))
+            return
+        if msg.text == '/stats':
+            ok, free = transfer.disk_ok(INBOX, 0)
+            lines = ['📊 当前传输任务：%d' % len(tasks.active)]
+            for key in list(tasks.active):
+                st = tasks.active.get(key)
+                if st is None:
+                    continue
+                prog = tasks.progress_of(key)
+                if prog is None:
+                    continue
+                lines.append('• %s：%s' % (st.get('phase', '传输中'), prog))
+            lines.append('💾 磁盘剩余：%.1fGB' % (free / 1073741824))
+            await _reply('\n'.join(lines))
+            return
+        if msg.text == '/history':
+            recs = history.read_history(10)
+            if not recs:
+                await _reply('📜 暂无传输记录。')
+                return
+            lines = ['📜 最近传输记录：']
+            for r in reversed(recs):
+                mark = '✅' if r.get('result') == 'ok' else '❌'
+                if r.get('result') == 'ok':
+                    lines.append('%s %s %s %s %d段 用时%s' % (
+                        mark, r.get('ts', ''), r.get('folder', ''),
+                        handlers.mb(r.get('size', 0)), r.get('parts', 0),
+                        r.get('elapsed', '')))
+                else:
+                    lines.append('%s %s 失败：%s' % (
+                        mark, r.get('ts', ''), r.get('error', '')[:60]))
+            await _reply('\n'.join(lines))
+            return
+        if msg.text.startswith('/getbot') or msg.text.startswith('/gb '):
+            await handlers._handle_getbot(event, msg.text)
+            return
+        if msg.text.startswith('/getcomments') or msg.text.startswith('/gc '):
+            await handlers._handle_getcomments(event, msg.text)
+            return
+        if msg.text.strip() == '/gcstatus':
+            _st = handlers.get_gc_status()
+            if not _st:
+                await event.reply('暂无评论拉取任务')
+            else:
+                import time as _t
+                _phase = _st.get('phase', '?')
+                _batches = _st.get('batches', 0)
+                _found = _st.get('found', 0)
+                _post = _st.get('post_id', '?')
+                _elapsed = int(_t.time() - _st.get('start_ts', _t.time()))
+                _phase_txt = {'scanning': '🔍 扫描中', 'scan_done': '✅ 扫描完成'}.get(_phase, _phase)
+                await event.reply(
+                    '💬 评论拉取状态\n帖子: %s\n状态: %s\n已扫: %d 批\n找到: %d 个媒体\n用时: %d 秒' % (
+                        _post, _phase_txt, _batches, _found, _elapsed))
+            return
+        if msg.text.strip() in ('/clean', '/c'):
+            busy = set()
+            for st in tasks.active.values():
+                busy.update(st.get('local_paths', set()))
+                if st.get('local_path'):
+                    busy.add(st['local_path'])
+            freed, count = 0, 0
+            try:
+                for f in os.listdir(INBOX):
+                    p = os.path.join(INBOX, f)
+                    if p in busy or not os.path.isfile(p):
+                        continue
+                    # 跳过 ffmpeg 切分中的临时分段文件（形如 xxx.seg001.mp4）
+                    if re.search(r'\.seg\d{3}\.', f):
+                        continue
+                    try:
+                        freed += os.path.getsize(p)
+                        os.remove(p)
+                        count += 1
+                    except OSError:
+                        pass
+            except OSError as e:
+                await _reply('清理失败：%s' % e)
+                return
+            await _reply('🧹 清理完成：删除 %d 个残留文件，释放 %s。'
+                              % (count, handlers.mb(freed)))
+            return
+        if msg.text and ('t.me/+' in msg.text or 't.me/joinchat/' in msg.text):
+            if await handlers.handle_invite_link(event, msg.text):
+                return
+        if msg.text and 't.me/' in msg.text:
+            await handlers.handle_tme_link(event, msg.text)
+            return
+        is_video = msg.video or (msg.document and msg.document.mime_type
+                                 and msg.document.mime_type.startswith('video'))
+        is_photo = msg.photo or (msg.document and msg.document.mime_type
+                                 and msg.document.mime_type.startswith('image'))
+        if is_video or is_photo:
+            grouped_id = getattr(msg, 'grouped_id', None)
+            if grouped_id:
+                # 相册：防抖 3 秒，收集同 grouped_id 的所有消息一起处理
+                import time as _t
+                _now = _t.time()
+                # 清理过期的
+                for k in [k for k, v in _pending_albums.items() if _now - v > 30]:
+                    del _pending_albums[k]
+                if grouped_id in _pending_albums:
+                    # 已在收集/处理中，跳过（由第一个触发的任务统一处理）
+                    return
+                _pending_albums[grouped_id] = _now
+                try:
+                    import time as _t2, random as _r2
+                    _batch_id2 = 'b%d%d' % (int(_t2.time()), _r2.randint(1000, 9999))
+                    notify.batch_init(_batch_id2)
+                    ack = await notify.bot_notify('📥 收到相册，排队中…',
+                                           buttons=notify.cancel_button('batch:' + _batch_id2))
+                except Exception:
+                    ack = None
+                    _batch_id2 = None
+                async def _process_album():
+                    try:
+                        # 等 3 秒让相册消息到齐
+                        await asyncio.sleep(3)
+                        # 从收藏夹取同 grouped_id 的消息
+                        album_msgs = []
+                        async for m in event.client.iter_messages(
+                                event.chat_id, min_id=max(0, msg.id - 20),
+                                max_id=msg.id + 20, limit=50):
+                            if getattr(m, 'grouped_id', None) == grouped_id and m.media:
+                                is_v = m.video or (m.document and m.document.mime_type
+                                                   and m.document.mime_type.startswith('video'))
+                                is_p = m.photo or (m.document and m.document.mime_type
+                                                   and m.document.mime_type.startswith('image'))
+                                if is_v or is_p:
+                                    album_msgs.append(m)
+                        # 去重排序
+                        seen = set()
+                        uniq = []
+                        for m in album_msgs:
+                            if m.id not in seen:
+                                seen.add(m.id)
+                                uniq.append(m)
+                        uniq.sort(key=lambda m: m.id)
+                        if not uniq:
+                            uniq = [msg]
+                        # 按 Telegram 文件大小去重：同一相册里大小完全相同的文件视为重复
+                        # （解决 8 个解析出 11 个上传的问题）
+                        _seen_sizes = set()
+                        _deduped = []
+                        for _m in uniq:
+                            _fsz = getattr(getattr(_m, 'file', None), 'size', 0) or 0
+                            if _fsz and _fsz in _seen_sizes:
+                                print('ALBUM_SKIP_DUP_SIZE id=%d size=%d' % (_m.id, _fsz), flush=True)
+                                continue
+                            if _fsz:
+                                _seen_sizes.add(_fsz)
+                            _deduped.append(_m)
+                        if len(_deduped) != len(uniq):
+                            print('ALBUM_DEDUP %d -> %d' % (len(uniq), len(_deduped)), flush=True)
+                        uniq = _deduped
+                        await handlers._send(event, ack, '📥 收到 %d 个媒体，转存中…' % len(uniq))
+                        # 建共享文件夹，一个个串行转存
+                        cloud = None
+                        if len(uniq) > 1:
+                            try:
+                                loop = asyncio.get_event_loop()
+                                _names = [handlers._extract_msg_name(m) for m in uniq]
+                                cloud = await loop.run_in_executor(None, handlers._prepare_cloud_album, _names)
+                            except Exception:
+                                cloud = None
+                        ok = 0
+                        _cid2 = getattr(event, 'chat_id', 'dm')
+                        _details = []
+                        _t0 = __import__('time').time()
+                        # 整个相册批量拿全局锁，和其他任务串行
+                        async with tasks._task_sem:
+                            # 拿到锁：把"排队中"改成"转存中"
+                            try:
+                                await notify.bot_edit(ack, '📥 收到相册，转存中…')
+                            except Exception:
+                                pass
+                            for i, m in enumerate(uniq, 1):
+                                try:
+                                    # 注册到批量取消
+                                    if _batch_id2:
+                                        notify.batch_register(_batch_id2, '%s_%s' % (_cid2, m.id))
+                                    await handlers._send(event, ack, '📥 正在转存第 %d/%d 个…' % (i, len(uniq)))
+                                    await handlers.handle_media(event, m, None, cloud, quiet=True, collector=_details)
+                                    ok += 1
+                                except Exception as e:
+                                    print('ALBUM_ONE_FAIL %d: %r' % (m.id, e), flush=True)
+                            # 循环结束后再清理批量记录（之前在循环内，每次都删导致取消按钮失效）
+                            notify.batch_pop(_batch_id2)
+                            _elapsed = __import__('time').time() - _t0
+                            _summary = notify.build_summary(ok, len(uniq), _details, _elapsed, label='转存')
+                            await notify.reply_autodelete(event, ack, _summary)
+                    finally:
+                        _pending_albums.pop(grouped_id, None)
+                tasks.spawn(_process_album(), 'album_direct')
+                return
+            # 单个媒体：先发"排队中"，拿到锁后 _queued_handle_media 会改成"转存中"
+            try:
+                _cid = getattr(msg, 'chat_id', None) or getattr(event, 'chat_id', 'dm')
+                _key = '%s_%s' % (_cid, msg.id)
+                ack = await notify.bot_notify('📥 收到，排队中…', buttons=notify.cancel_button(_key))
+            except Exception:
+                ack = None
+            tasks.spawn(handlers._queued_handle_media(event, msg, ack), 'handle_media')
+
+    await client.start()
+    me = await client.get_me()
+    global OWNER_ID
+    OWNER_ID = me.id
+    print('USER_LOGIN as %s (id=%d)' % (
+        getattr(me, 'username', '') or 'user', me.id), flush=True)
+    # 定时进度播报已去掉（用户要求）：只保留收/发两条通知，进度看面板
+    # tasks.spawn(progress_notifier(client), 'progress_notifier')
+    dash_token = cfg.get('dashboard_token')
+    if dash_token:
+        dashboard.start_dashboard(8899, dash_token, history.snapshot,
+                                      cancel_fn=tasks.cancel_task,
+                                      del_history_fn=history.delete_history_entry,
+                                      clear_history_fn=history.clear_history)
+    else:
+        print('DASHBOARD disabled (no dashboard_token in config)', flush=True)
+    print('BOT_RUNNING autosync=on progress_notify=10min split=>60min seg=30min', flush=True)
+    # 初始化 Bot 通知客户端
+    global _bot_client
+    if BOT_TOKEN:
+        try:
+            from telethon import TelegramClient as _TC2
+            _bot_client = _TC2('bot_notify_session', API_ID, API_HASH)
+            await _bot_client.start(bot_token=BOT_TOKEN)
+            print('BOT_NOTIFY_READY', flush=True)
+            # 初始化通知模块
+            notify.init(_bot_client, OWNER, tasks.cancel_task, _tele_Button, tasks, history, retry_fn=handlers._do_retry, batch_status_fn=handlers.get_batch_status)
+            notify.register_cancel_handler(_bot_client, _tele_events)
+            # 设置 bot 命令列表（输入 / 显示候选）
+            try:
+                await notify.set_bot_commands(_bot_client)
+            except Exception as e:
+                print('SET_COMMANDS_FAIL: %r' % e, flush=True)
+            # 2026-10-05: bot 收文件，同步后删除原消息
+            @_bot_client.on(_tele_events.NewMessage)
+            async def _on_bot_media(ev):
+                # 只收 owner 发的媒体
+                if str(getattr(ev, 'sender_id', '')) != str(OWNER):
+                    return
+                msg = ev.message
+                is_media = (msg.video or msg.photo or
+                           (msg.document and msg.document.mime_type and
+                            (msg.document.mime_type.startswith('video') or
+                             msg.document.mime_type.startswith('image'))))
+                if not is_media:
+                    return
+                # 转给 handlers 处理（复用现有流程）
+                try:
+                    ack = await notify.bot_notify('📥 收到，转存中…')
+                    await handlers.handle_media(ev, msg, ack=ack)
+                    # 同步完删原消息
+                    try:
+                        await ev.delete()
+                    except Exception:
+                        pass
+                except Exception as e:
+                    print('BOT_MEDIA_FAIL: %r' % e, flush=True)
+                    try:
+                        await notify.bot_notify('❌ 转存失败：%s' % str(e)[:80])
+                    except Exception:
+                        pass
+            # 2026-10-05: bot 也支持 t.me 链接和 /getbot
+            @_bot_client.on(_tele_events.NewMessage(pattern=r'^/(getcomments|gc)( |$|_)'))
+            async def _on_bot_getcomments(ev):
+                if str(getattr(ev, 'sender_id', '')) != str(OWNER):
+                    return
+                try:
+                    # 同步完成后才删原消息（不在这里立即删）
+                    await handlers._handle_getcomments(ev, ev.message.text, delete_after=True)
+                except Exception as e:
+                    print('BOT_GETCOMMENTS_FAIL: %r' % e, flush=True)
+            @_bot_client.on(_tele_events.NewMessage(pattern=r'^/gcstatus$'))
+            async def _on_bot_gcstatus(ev):
+                if str(getattr(ev, 'sender_id', '')) != str(OWNER):
+                    return
+                try:
+                    _st = handlers.get_gc_status()
+                    if not _st:
+                        await ev.reply('暂无评论拉取任务')
+                    else:
+                        import time as _t
+                        _phase = _st.get('phase', '?')
+                        _batches = _st.get('batches', 0)
+                        _found = _st.get('found', 0)
+                        _post = _st.get('post_id', '?')
+                        _elapsed = int(_t.time() - _st.get('start_ts', _t.time()))
+                        _phase_txt = {'scanning': '🔍 扫描中', 'scan_done': '✅ 扫描完成'}.get(_phase, _phase)
+                        await ev.reply(
+                            '💬 评论拉取状态\n帖子: %s\n状态: %s\n已扫: %d 批\n找到: %d 个媒体\n用时: %d 秒' % (
+                                _post, _phase_txt, _batches, _found, _elapsed))
+                except Exception as e:
+                    print('BOT_GCSTATUS_FAIL: %r' % e, flush=True)
+            @_bot_client.on(_tele_events.NewMessage(pattern=r'^/getbot'))
+            async def _on_bot_getbot(ev):
+                if str(getattr(ev, 'sender_id', '')) != str(OWNER):
+                    return
+                try:
+                    await handlers._handle_getbot(ev, ev.message.text)
+                    try:
+                        await ev.delete()
+                    except Exception:
+                        pass
+                except Exception as e:
+                    print('BOT_GETBOT_FAIL: %r' % e, flush=True)
+            # 2026-10-05: bot 复刻收藏夹命令
+            @_bot_client.on(_tele_events.NewMessage(pattern=r'^/start$'))
+            async def _on_bot_start(ev):
+                if str(getattr(ev, 'sender_id', '')) != str(OWNER):
+                    return
+                await ev.reply(
+                    '收藏夹同步已开启。把视频/图片发到收藏夹或这里，我自动存到网盘。\n'
+                    '当前网盘：%s\n'
+                    '命令：/menu 快捷菜单，/stats 传输状态，/history 最近记录。'
+                    % ' + '.join(cloudmod.labels()))
+            @_bot_client.on(_tele_events.NewMessage(pattern=r'^/drive'))
+            async def _on_bot_drive(ev):
+                if str(getattr(ev, 'sender_id', '')) != str(OWNER):
+                    return
+                _parts = (ev.message.text or '').split()
+                if len(_parts) == 1:
+                    lines = ['🌐 当前网盘：%s' % ' + '.join(cloudmod.labels())]
+                    try:
+                        _hs = cloudmod.health()
+                        for _k, _lab, _ok, _why in _hs:
+                            lines.append('%s %s%s' % ('✅' if _ok else '❌', _lab,
+                                                      '' if _ok else '：%s' % _why))
+                    except Exception as e:
+                        lines.append('探测失败：%r' % (e,))
+                    lines.append('当前只有阿里云盘')
+                    await ev.reply('\n'.join(lines))
+                    return
+                _arg = _parts[1].lower()
+                if _arg == 'both':
+                    _keys = ['ali']
+                elif _arg in cloudmod.KEYS:
+                    _keys = [_arg]
+                else:
+                    await ev.reply('用法：/drive ali')
+                    return
+                try:
+                    _keys = cloudmod.set_targets(_keys)
+                except Exception as e:
+                    await ev.reply('❌ 切换失败：%s' % str(e)[:120])
+                    return
+                await ev.reply('✅ 已切换到：%s' % ' + '.join(cloudmod.labels(_keys)))
+            @_bot_client.on(_tele_events.NewMessage(pattern=r'^/clean$'))
+            async def _on_bot_clean(ev):
+                if str(getattr(ev, 'sender_id', '')) != str(OWNER):
+                    return
+                busy = set()
+                for st in tasks.active.values():
+                    busy.update(st.get('local_paths', set()))
+                    if st.get('local_path'):
+                        busy.add(st['local_path'])
+                freed, count = 0, 0
+                try:
+                    for f in os.listdir(INBOX):
+                        p = os.path.join(INBOX, f)
+                        if p in busy or not os.path.isfile(p):
+                            continue
+                        if re.search(r'\.seg\d{3}\.', f):
+                            continue
+                        try:
+                            freed += os.path.getsize(p)
+                            os.remove(p)
+                            count += 1
+                        except OSError:
+                            pass
+                except OSError as e:
+                    await ev.reply('清理失败：%s' % e)
+                    return
+                await ev.reply('🧹 清理完成：删除 %d 个残留文件，释放 %s。'
+                                  % (count, handlers.mb(freed)))
+            # 2026-10-05: bot 也支持扫码登录
+            @_bot_client.on(_tele_events.NewMessage(pattern=r'^/alipanlogin$'))
+            async def _on_bot_alipanlogin(ev):
+                if str(getattr(ev, 'sender_id', '')) != str(OWNER):
+                    return
+                await ev.reply('🔐 正在生成阿里云盘登录二维码…')
+                loop = asyncio.get_event_loop()
+                async def _send_qr(png_path, caption):
+                    try:
+                        await ev.reply(file=png_path, message=caption)
+                    except Exception as e:
+                        print('ALIPAN_QR_BOT_SEND_FAIL %r' % e, flush=True)
+                def _do():
+                    from tg_bot import alipan_login
+                    return alipan_login.login_qr_loop(send_tg_fn=_send_qr, main_loop=loop)
+                async def _runner():
+                    try:
+                        await loop.run_in_executor(None, _do)
+                        await ev.reply('✅ 阿里云盘已接上。')
+                    except Exception as e:
+                        await ev.reply('❌ 阿里云盘登录失败：%s' % str(e)[:160])
+                tasks.spawn(_runner(), 'alipan_login_bot')
+            @_bot_client.on(_tele_events.NewMessage)
+            async def _on_bot_tme(ev):
+                text = ev.message.text or ''
+                if 't.me/' not in text:
+                    return
+                # /getcomments 命令已由专用 handler 处理，这里跳过防重复
+                _t = text.strip()
+                if _t.startswith('/getcomments') or _t.startswith('/gc '):
+                    return
+                if str(getattr(ev, 'sender_id', '')) != str(OWNER):
+                    return
+                try:
+                    if 't.me/+' in text or 't.me/joinchat/' in text:
+                        await handlers.handle_invite_link(ev, text)
+                    else:
+                        await handlers.handle_tme_link(ev, text)
+                    try:
+                        await ev.delete()
+                    except Exception:
+                        pass
+                except Exception as e:
+                    print('BOT_TME_FAIL: %r' % e, flush=True)
+            print('BOT_NOTIFY_READY_DONE', flush=True)
+        except Exception as e:
+            print('BOT_NOTIFY_INIT_FAIL: %r' % e, flush=True)
+            _bot_client = None
+    # 断点续传：扫描 resume 状态，重新排队未完成的任务
+    try:
+        _resume_tasks = []
+        for f in os.listdir(INBOX):
+            if not f.endswith('.resume.json'):
+                continue
+            try:
+                with open(os.path.join(INBOX, f)) as jf:
+                    rs = json.load(jf)
+                if rs.get('phase') in ('download', 'upload') and rs.get('chat_id') and rs.get('msg_id'):
+                    _resume_tasks.append(rs)
+            except (OSError, ValueError):
+                pass
+        # 2026-10-04 修：清理孤立的 part 文件（上次切分残留），避免 resume 时状态不一致
+        # part 文件命名不含 task key，无法精确匹配，全部清理后重切（stream copy 很快）
+        try:
+            for _pf in os.listdir(INBOX):
+                if '_part' in _pf and _pf.endswith('.mp4'):
+                    try:
+                        os.remove(os.path.join(INBOX, _pf))
+                        print('RESUME_CLEAN_PART %s' % _pf, flush=True)
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+        if _resume_tasks:
+            print('RESUME_REQUEUE %d tasks' % len(_resume_tasks), flush=True)
+            for rs in _resume_tasks:
+                try:
+                    _msg = await client.get_messages(rs['chat_id'], ids=rs['msg_id'])
+                    if _msg and (_msg.video or _msg.photo or _msg.document):
+                        # 构造最小 event 对象
+                        _fake_event = type('E', (), {'client': client, 'chat_id': rs['chat_id']})()
+                        tasks.spawn(handlers._queued_handle_media(_fake_event, _msg, None), 'resume_media')
+                        print('RESUME_QUEUED %s' % rs.get('name', rs['key']), flush=True)
+                    else:
+                        print('RESUME_MSG_GONE %s' % rs.get('key'), flush=True)
+                        tasks.clear_resume_state(rs['key'])
+                except Exception as _re:
+                    print('RESUME_REQUEUE_FAIL %s %r' % (rs.get('key'), _re), flush=True)
+    except Exception as _e:
+        print('RESUME_SCAN_FAIL %r' % (_e,), flush=True)
+
+    # 启动 session 健康检查（自愈）
+    tasks.spawn(health.health_loop(lambda: client, lambda: _bot_client), 'health_loop')
+    jlog.log('bot_started', version=VERSION)
+
+    await client.run_until_disconnected()
+
+asyncio.run(main())

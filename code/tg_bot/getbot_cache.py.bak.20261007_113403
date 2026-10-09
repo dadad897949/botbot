@@ -1,0 +1,143 @@
+"""getbot 收集缓存：只存元数据，不存文件本体。
+
+2026-10-07：bot 在收集完成后、下载前重启会导致任务丢失。
+收集完成后立即写缓存，重启后可恢复。
+"""
+import os
+import sqlite3
+import time
+
+_CACHE_DB = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'config', 'getbot_cache.db')
+
+def _conn():
+    conn = sqlite3.connect(_CACHE_DB, timeout=10)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_cache():
+    """创建缓存表"""
+    conn = _conn()
+    try:
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS getbot_cache (
+                task_id TEXT NOT NULL,
+                idx INTEGER NOT NULL,
+                msg_id INTEGER NOT NULL,
+                chat_id INTEGER NOT NULL,
+                file_name TEXT,
+                size_bytes INTEGER DEFAULT 0,
+                is_photo INTEGER DEFAULT 0,
+                status TEXT DEFAULT 'pending',
+                created_at REAL,
+                updated_at REAL,
+                PRIMARY KEY (task_id, msg_id)
+            )
+        ''')
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS getbot_task (
+                task_id TEXT PRIMARY KEY,
+                bot_username TEXT,
+                cloud_dir TEXT,
+                total INTEGER,
+                created_at REAL
+            )
+        ''')
+        conn.commit()
+    finally:
+        conn.close()
+
+def save_collection(task_id, collected, bot_username, cloud_dir, chat_id):
+    """保存收集的元数据。collected 是 Telethon Message 列表"""
+    init_cache()
+    conn = _conn()
+    try:
+        now = time.time()
+        conn.execute(
+            'INSERT OR REPLACE INTO getbot_task (task_id, bot_username, cloud_dir, total, created_at) VALUES (?, ?, ?, ?, ?)',
+            (task_id, bot_username, cloud_dir, len(collected), now)
+        )
+        for idx, m in enumerate(collected):
+            # 提取元数据，不存本体
+            msg_id = getattr(m, 'id', 0)
+            # 文件名
+            fname = ''
+            try:
+                if getattr(m, 'file', None) and getattr(m.file, 'name', None):
+                    fname = m.file.name
+                elif getattr(m, 'document', None):
+                    for attr in getattr(m.document, 'attributes', []):
+                        if hasattr(attr, 'file_name') and attr.file_name:
+                            fname = attr.file_name
+                            break
+            except Exception:
+                pass
+            # 大小
+            fsize = 0
+            try:
+                if getattr(m, 'file', None) and getattr(m.file, 'size', None):
+                    fsize = m.file.size
+            except Exception:
+                pass
+            # 是否图片
+            is_photo = 1 if getattr(m, 'photo', None) else 0
+            conn.execute(
+                '''INSERT OR REPLACE INTO getbot_cache
+                   (task_id, idx, msg_id, chat_id, file_name, size_bytes, is_photo, status, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)''',
+                (task_id, idx, msg_id, chat_id, fname, fsize, is_photo, now, now)
+            )
+        conn.commit()
+        print('GETBOT_CACHE saved %d files for task %s' % (len(collected), task_id), flush=True)
+    finally:
+        conn.close()
+
+def mark_done(task_id, msg_id):
+    """标记单个文件下载完成"""
+    conn = _conn()
+    try:
+        conn.execute(
+            "UPDATE getbot_cache SET status='done', updated_at=? WHERE task_id=? AND msg_id=?",
+            (time.time(), task_id, msg_id)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+def get_pending(task_id):
+    """获取待下载的项"""
+    conn = _conn()
+    try:
+        rows = conn.execute(
+            "SELECT msg_id, chat_id, file_name, size_bytes, is_photo FROM getbot_cache WHERE task_id=? AND status='pending' ORDER BY idx",
+            (task_id,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+def get_incomplete_tasks():
+    """获取未完成的任务（重启恢复用）"""
+    init_cache()
+    conn = _conn()
+    try:
+        rows = conn.execute('''
+            SELECT t.task_id, t.bot_username, t.cloud_dir, t.total,
+                   COUNT(c.msg_id) as pending
+            FROM getbot_task t
+            JOIN getbot_cache c ON t.task_id = c.task_id AND c.status='pending'
+            GROUP BY t.task_id
+        ''').fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+def clear_task(task_id):
+    """清除已完成的任务"""
+    conn = _conn()
+    try:
+        conn.execute("DELETE FROM getbot_cache WHERE task_id=?", (task_id,))
+        conn.execute("DELETE FROM getbot_task WHERE task_id=?", (task_id,))
+        conn.commit()
+        print('GETBOT_CACHE cleared task %s' % task_id, flush=True)
+    finally:
+        conn.close()

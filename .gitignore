@@ -1,0 +1,22 @@
+# 敏感文件
+config/tg_config.json
+config/bot_config.json
+config/proxy.json
+*.session
+*.session-journal
+.aligo/
+getbot_*.db
+getbot_*.json
+*_whitelist.json
+*_index.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+
+# 日志和临时文件
+*.log
+bot_inbox/
+tmp/
